@@ -69,7 +69,12 @@
   let replayScores = null;
   let title = { t0: 0, reg: 1, leaveAt: 0 };
 
-  const later = (sec, fn) => timers.push({ at: clock + sec, fn });
+  let nextDue = Infinity; // earliest timer, so idle frames skip the queue
+  const later = (sec, fn) => {
+    const at = clock + sec;
+    timers.push({ at, fn });
+    if (at < nextDue) nextDue = at;
+  };
   const spd = () => (V && V.fast ? 0.5 : 1);
   const humanCount = () => seats.filter(s => s === 0).length;
   const markSeen = k => {
@@ -132,12 +137,12 @@
     const dt = Math.min(0.05, lastTs ? (ts - lastTs) / 1000 : 0.016);
     lastTs = ts;
     if (!menuOpen) clock += dt;
-    if (timers.length) {
+    if (timers.length && clock >= nextDue) {
       const due = timers.filter(t => t.at <= clock);
-      if (due.length) {
-        timers = timers.filter(t => t.at > clock);
-        due.forEach(t => t.fn());
-      }
+      timers = timers.filter(t => t.at > clock);
+      nextDue = Infinity;
+      for (const t of timers) if (t.at < nextDue) nextDue = t.at;
+      due.forEach(t => t.fn());
     }
     if (scene === 'title') {
       R.drawTitle(clock, ptr.x < 0 ? W / 2 : ptr.x, ptr.y < 0 ? H / 2 : ptr.y);
@@ -151,7 +156,7 @@
 
   function update(dt) {
     V.now = clock;
-    for (const st of V.stamps.slice()) {
+    if (V.stamps.length) for (const st of V.stamps.slice()) {
       if (!st.impacted && clock >= st.impactAt) {
         st.impacted = true;
         st.landed = true;
@@ -162,8 +167,8 @@
         st.onDone();
       }
     }
-    V.ripples = V.ripples.filter(r => clock - r.t0 < r.dur);
-    for (const tk of V.tokens.slice()) {
+    if (V.ripples.length && V.ripples.some(r => clock - r.t0 >= r.dur)) V.ripples = V.ripples.filter(r => clock - r.t0 < r.dur);
+    if (V.tokens.length) for (const tk of V.tokens.slice()) {
       if (clock >= tk.t0 + tk.dur) {
         V.tokens.splice(V.tokens.indexOf(tk), 1);
         if (tk.onLand) tk.onLand();
@@ -222,12 +227,13 @@
     logoCtx = logoCv.getContext('2d');
     logoCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
     logoCv._cs = cs;
+    logoLast = null;
   }
+  let logoLast = null; // plate offsets last printed: a logo at rest isn't re-printed every frame
   function drawLogo(dt) {
     if (!logoCtx) return;
     const cs = logoCv._cs;
     const x = logoCtx;
-    x.clearRect(0, 0, logoCv.width, logoCv.height);
     const t = clock - title.t0;
     const target = title.leaveAt ? 0 : 1;
     title.reg = U.damp(title.reg, target, title.leaveAt ? 22 : 4, dt);
@@ -236,11 +242,16 @@
     // so the very first frame (and any link preview) already shows the name
     const settle = U.easeOutBack(U.clamp(t / 0.95, 0, 1), 1.5);
     const rg = title.reg * U.lerp(4.2, 1, settle);
-    const offA = [(-0.1 + px * 0.08) * cs * rg, (-0.08 + py * 0.06) * cs * rg];
-    const offB = [(0.2 - px * 0.08) * cs * rg, (0.16 - py * 0.06) * cs * rg];
-    R.drawLogo(x, cs, cs, cs, offA, offB, INK[0], INK[1]);
+    const a0 = (-0.1 + px * 0.08) * cs * rg, a1 = (-0.08 + py * 0.06) * cs * rg;
+    const b0 = (0.2 - px * 0.08) * cs * rg, b1 = (0.16 - py * 0.06) * cs * rg;
+    const L0 = logoLast;
+    if (L0 && Math.abs(L0[0] - a0) < 0.01 && Math.abs(L0[1] - a1) < 0.01 && Math.abs(L0[2] - b0) < 0.01 && Math.abs(L0[3] - b1) < 0.01) return;
+    logoLast = [a0, a1, b0, b1];
+    x.clearRect(0, 0, logoCv.width, logoCv.height);
+    R.drawLogo(x, cs, cs, cs, [a0, a1], [b0, b1], INK[0], INK[1]);
     R.applyGrain(x, logoCv.width, logoCv.height);
   }
+
 
   // v: 0 = player, 1–3 = CPU level
   function setSeat(p, v) {
@@ -1042,6 +1053,7 @@
     V.humanTurn = false;
     const power = hd.uses ? armed : -1;
     if (power >= 0) fireToken(hd.p, power);
+    V.flyingPid[hd.p] = hd.pid; // it's on its way down: keep its tray slot empty until it lands
     commitMove(hd.p, hd.pid, hd.abs.slice(), power, { x: hd.px, y: hd.py, cs: L.board.cs }, 0);
   }
 
@@ -1570,7 +1582,13 @@
 
   /* ------------------------------------------------------------- wire */
   function wire() {
-    window.addEventListener('resize', resize);
+    let resizeFrame = 0;
+    window.addEventListener('resize', () => {
+      if (!resizeFrame) resizeFrame = requestAnimationFrame(() => {
+        resizeFrame = 0;
+        resize();
+      });
+    });
     stage.addEventListener('pointerdown', onDown);
     window.addEventListener('pointermove', onMove);
     window.addEventListener('pointerup', onUp);

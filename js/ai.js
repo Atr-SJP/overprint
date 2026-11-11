@@ -162,17 +162,18 @@
   }
 
   /* --------------------------------------------------------------- expert */
-  function countMoves(g, q, cap) {
+  function countMoves(g, q, cap, ctx) {
     let n = 0;
-    E.forEachMove(g, q, -1, () => ++n >= cap);
+    E.forEachMove(g, q, -1, () => ++n >= cap, -1, ctx);
     return n;
   }
 
   // squares still in hand that have at least one legal spot: points that can still be scored
-  function fitSquares(g, q) {
+  const yes = () => true;
+  function fitSquares(g, q, ctx) {
     const pl = g.players[q];
     let s = 0;
-    for (let pid = 0; pid < 21; pid++) if (pl.hand[pid] && E.forEachMove(g, q, -1, () => true, pid)) s += OP.PIECES[pid].size;
+    for (let pid = 0; pid < 21; pid++) if (pl.hand[pid] && E.forEachMove(g, q, -1, yes, pid, ctx)) s += OP.PIECES[pid].size;
     return s;
   }
 
@@ -184,14 +185,17 @@
     pl.hand[m.pid] = false;
     pl.handCount--;
     pl.placed++;
-    const mine = pl.handCount ? countMoves(g, p, DEEP.capMine) : DEEP.capMine;
-    const fit = fitSquares(g, p);
+    // one context per player for this position, shared by both measurements
+    const mineCtx = E.moveContext(g, p, -1);
+    const mine = pl.handCount ? countMoves(g, p, DEEP.capMine, mineCtx) : DEEP.capMine;
+    const fit = fitSquares(g, p, mineCtx);
     let opp = 0, oppFit = 0, rivals = 0;
     for (let q = 0; q < 4; q++) {
       if (q === p || g.players[q].out) continue;
       rivals++;
-      opp += Math.log1p(countMoves(g, q, DEEP.capOpp));
-      oppFit += fitSquares(g, q);
+      const ctx = E.moveContext(g, q, -1);
+      opp += Math.log1p(countMoves(g, q, DEEP.capOpp, ctx));
+      oppFit += fitSquares(g, q, ctx);
     }
     m.cells.forEach((i, k) => (C[i] = prev[k]));
     pl.hand[m.pid] = true;

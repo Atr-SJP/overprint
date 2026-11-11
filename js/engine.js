@@ -261,23 +261,76 @@
     return true;
   }
 
+  // each orientation as flat offsets (r * N + c), so a placement is just base + offset
+  for (const P of PIECES) {
+    for (const O of P.orients) {
+      O.off = Int16Array.from(O.cells.map(([r, c]) => r * N + c));
+      O.dr = Int8Array.from(O.cells.map(([r]) => r));
+      O.dc = Int8Array.from(O.cells.map(([, c]) => c));
+    }
+  }
+
+  /**
+   * Everything legality depends on for player p in the current position, worked out once:
+   * which squares sit beside or diagonal to their ink, and where a new piece could start.
+   * Only valid until the board changes.
+   */
+  function moveContext(g, p, power = -1) {
+    const C = g.cells, pl = g.players[p];
+    const orth = new Uint8Array(NN), diag = new Uint8Array(NN);
+    for (let i = 0; i < NN; i++) {
+      if (C[i] !== p) continue;
+      const O = ORTH[i];
+      for (let j = 0; j < O.length; j++) orth[O[j]] = 1;
+      const D = DIAG[i];
+      for (let j = 0; j < D.length; j++) diag[D[j]] = 1;
+    }
+    let anchors = null; // null = anywhere (Offset)
+    if (pl.placed === 0) anchors = C[CORNERS[p]] === EMPTY ? [CORNERS[p]] : [];
+    else if (power !== OFFSET) {
+      anchors = [];
+      for (let i = 0; i < NN; i++) {
+        const v = C[i];
+        if (v === HOLE || v === p) continue;
+        if (v !== EMPTY && power !== OVERPRINT) continue;
+        if (power === BLEED ? diag[i] || orth[i] : diag[i] && !orth[i]) anchors.push(i);
+      }
+    }
+    return { C, p, power, orth, diag, anchors, first: pl.placed === 0 };
+  }
+
   /** Squares where player p could anchor a new piece (diagonal to their ink, never beside it). */
   function anchorsFor(g, p, power = -1) {
-    const C = g.cells, pl = g.players[p];
-    if (pl.placed === 0) return C[CORNERS[p]] === EMPTY ? [CORNERS[p]] : [];
-    const out = [];
-    for (let i = 0; i < NN; i++) {
-      const v = C[i];
-      if (v === HOLE || v === p) continue;
-      if (v !== EMPTY && power !== OVERPRINT) continue;
-      let d = false, o = false;
-      const D = DIAG[i];
-      for (let j = 0; j < D.length; j++) if (C[D[j]] === p) { d = true; break; }
-      const O = ORTH[i];
-      for (let j = 0; j < O.length; j++) if (C[O[j]] === p) { o = true; break; }
-      if (power === BLEED ? d || o : d && !o) out.push(i);
+    return moveContext(g, p, power === OFFSET ? -1 : power).anchors;
+  }
+
+  // check() for the enumeration hot path: the same rules, read from a move context
+  function checkCtx(ctx, cells, n, power, out) {
+    const C = ctx.C, p = ctx.p, orth = ctx.orth, diag = ctx.diag, home = CORNERS[p];
+    let over = 0, edge = false, corner = false, start = false;
+    for (let k = 0; k < n; k++) {
+      const i = cells[k], v = C[i];
+      if (v !== EMPTY) {
+        if (v === HOLE || v === p || power !== OVERPRINT) return false;
+        if (++over > MAX_OVER) return false;
+      }
+      if (i === home) start = true;
+      if (orth[i]) edge = true;
+      if (diag[i]) corner = true;
     }
-    return out;
+    if (ctx.first) {
+      if (!start || over > 0) return false;
+      out.over = 0;
+      out.uses = false;
+      return true;
+    }
+    if (edge && power !== BLEED) return false;
+    if (power === BLEED) {
+      if (!edge && !corner) return false;
+    } else if (power !== OFFSET && !corner) return false;
+    out.over = over;
+    out.uses = power === OVERPRINT ? over > 0 : power === BLEED ? edge : power === OFFSET ? !corner : false;
+    return true;
   }
 
   const SEEN = new Uint32Array(NN);
@@ -287,25 +340,28 @@
 
   /**
    * Visit every legal placement. fn(pid, orient, r0, c0, cells, n, info) — return true to stop.
-   * `cells` is a shared buffer: copy it if you keep it.
+   * `cells` is a shared buffer: copy it if you keep it. Pass a moveContext for this player,
+   * power and position to skip recomputing it.
    */
-  function forEachMove(g, p, power, fn, onlyPid = -1) {
+  function forEachMove(g, p, power, fn, onlyPid = -1, ctx = null) {
     const pl = g.players[p];
     if (pl.handCount === 0) return false;
     if (pl.placed === 0 && power >= 0) return false;
-    const full = power === OFFSET;
-    const anchors = full ? null : anchorsFor(g, p, power);
+    if (!ctx || ctx.p !== p || ctx.power !== power) ctx = moveContext(g, p, power);
+    const anchors = ctx.anchors;
     if (anchors && !anchors.length) return false;
-    for (let pid = 0; pid < 21; pid++) {
-      if (!pl.hand[pid] || (onlyPid >= 0 && pid !== onlyPid)) continue;
+    for (let pid = onlyPid >= 0 ? onlyPid : 0; pid < 21; pid++) {
+      if (onlyPid >= 0 && pid !== onlyPid) break;
+      if (!pl.hand[pid]) continue;
       const P = PIECES[pid];
       for (let oi = 0; oi < P.orients.length; oi++) {
-        const O = P.orients[oi], oc = O.cells, n = oc.length;
-        if (full) {
-          for (let r0 = 0; r0 + O.h <= N; r0++) {
-            for (let c0 = 0; c0 + O.w <= N; c0++) {
-              for (let k = 0; k < n; k++) BUF[k] = (r0 + oc[k][0]) * N + c0 + oc[k][1];
-              if (check(g, p, BUF, n, power, INFO) && fn(pid, oi, r0, c0, BUF, n, INFO)) return true;
+        const O = P.orients[oi], off = O.off, dr = O.dr, dc = O.dc, n = off.length, h = O.h, w = O.w;
+        if (!anchors) {
+          for (let r0 = 0; r0 + h <= N; r0++) {
+            for (let c0 = 0; c0 + w <= N; c0++) {
+              const base = r0 * N + c0;
+              for (let k = 0; k < n; k++) BUF[k] = base + off[k];
+              if (checkCtx(ctx, BUF, n, power, INFO) && fn(pid, oi, r0, c0, BUF, n, INFO)) return true;
             }
           }
         } else {
@@ -316,13 +372,13 @@
           for (let a = 0; a < anchors.length; a++) {
             const ar = (anchors[a] / N) | 0, ac = anchors[a] % N;
             for (let k = 0; k < n; k++) {
-              const r0 = ar - oc[k][0], c0 = ac - oc[k][1];
-              if (r0 < 0 || c0 < 0 || r0 + O.h > N || c0 + O.w > N) continue;
-              const key = r0 * N + c0;
-              if (SEEN[key] === seenGen) continue;
-              SEEN[key] = seenGen;
-              for (let q = 0; q < n; q++) BUF[q] = (r0 + oc[q][0]) * N + c0 + oc[q][1];
-              if (check(g, p, BUF, n, power, INFO) && fn(pid, oi, r0, c0, BUF, n, INFO)) return true;
+              const r0 = ar - dr[k], c0 = ac - dc[k];
+              if (r0 < 0 || c0 < 0 || r0 + h > N || c0 + w > N) continue;
+              const base = r0 * N + c0;
+              if (SEEN[base] === seenGen) continue;
+              SEEN[base] = seenGen;
+              for (let q = 0; q < n; q++) BUF[q] = base + off[q];
+              if (checkCtx(ctx, BUF, n, power, INFO) && fn(pid, oi, r0, c0, BUF, n, INFO)) return true;
             }
           }
         }
@@ -345,9 +401,11 @@
   function movablePieces(g, p, power = -1) {
     const res = new Uint8Array(21);
     const pl = g.players[p];
+    const plain = moveContext(g, p, -1);
+    const armed = power >= 0 && pl.placed > 0 ? moveContext(g, p, power) : null;
     for (let pid = 0; pid < 21; pid++) {
       if (!pl.hand[pid]) continue;
-      res[pid] = forEachMove(g, p, -1, yes, pid) || (power >= 0 && forEachMove(g, p, power, yes, pid)) ? 1 : 0;
+      res[pid] = forEachMove(g, p, -1, yes, pid, plain) || (armed && forEachMove(g, p, power, yes, pid, armed)) ? 1 : 0;
     }
     return res;
   }
@@ -423,7 +481,7 @@
 
   OP.E = {
     N, NN, EMPTY, HOLE, OVERPRINT, BLEED, OFFSET, MAX_OVER, FULL_BONUS, CORNERS, ORTH, DIAG,
-    rot90, createGame, check, anchorsFor, forEachMove, hasAnyMove, movablePieces, applyMove,
+    rot90, createGame, check, moveContext, anchorsFor, forEachMove, hasAnyMove, movablePieces, applyMove,
     score, advance, standings,
   };
 })(typeof window !== 'undefined' ? window : globalThis);

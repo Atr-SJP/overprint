@@ -16,6 +16,7 @@
   let paperPat, sheetPat;
   let bgCanvas, paperCanvas, sheetCanvas, gridCanvas, inkCanvas, inkCtx;
   let titleCanvas;
+  let layoutVersion = 0;
 
   const KEY = THEME.key;
   const INK = THEME.inks;
@@ -186,10 +187,16 @@
   }
 
   /* ---------------------------------------------------------- outline */
+  const outlineByArray = new WeakMap(); // fast path: same array, same outline, no string building
   function outlineOf(cells) {
-    const key = cells.map(c => c[0] + ',' + c[1]).join(';');
-    let o = outlineCache.get(key);
+    let o = outlineByArray.get(cells);
     if (o) return o;
+    const key = cells.map(c => c[0] + ',' + c[1]).join(';');
+    o = outlineCache.get(key);
+    if (o) {
+      outlineByArray.set(cells, o);
+      return o;
+    }
     const set = new Set(cells.map(([r, c]) => r * 1000 + c));
     const has = (r, c) => set.has(r * 1000 + c);
     const edges = new Map();
@@ -232,6 +239,7 @@
     }
     o = { loops, seams };
     outlineCache.set(key, o);
+    outlineByArray.set(cells, o);
     return o;
   }
 
@@ -444,6 +452,7 @@
     paperPat = patternOf(paperTile);
     sheetPat = patternOf(sheetTile);
     L = computeLayout(w, h);
+    layoutVersion++;
     buildBackground();
     buildSheet();
     inkCanvas = makeCanvas(L.board.size * dpr, L.board.size * dpr);
@@ -568,6 +577,7 @@
 
   /* ------------------------------------------------------------ helpers */
   R.layout = () => L;
+  R._ctx = () => ctx;
   R.cellRect = i => {
     const b = L.board, r = (i / N) | 0, c = i % N;
     return { x: b.x + c * b.cs, y: b.y + r * b.cs, s: b.cs };
@@ -699,12 +709,14 @@
     { pid: 3, rot: 2, flip: 0, p: 0, fx: 0.25, fy: -0.03, k: 0.7, depth: 20 },
   ];
 
+  for (const tp of TITLE_PIECES) tp.cells = OP.pieceTransform(PIECES[tp.pid].base, tp.rot, !!tp.flip);
+
   R.drawTitle = (t, mx, my) => {
     R.clear(true);
     const unit = Math.max(26, Math.min(W, H) / 8.2);
     const px = (mx / W - 0.5) * 2, py = (my / H - 0.5) * 2;
     for (const tp of TITLE_PIECES) {
-      const cells = OP.pieceTransform(PIECES[tp.pid].base, tp.rot, !!tp.flip);
+      const cells = tp.cells;
       const cs = unit * tp.k;
       const bob = Math.sin(t * 0.6 + tp.depth) * 3;
       const ox = tp.fx * W - px * tp.depth, oy = tp.fy * H - py * tp.depth + bob;
@@ -747,28 +759,32 @@
     shadowFill(V.shadowTo, V.shadowT);
     ctx.globalAlpha = 1;
 
-    ctx.drawImage(sheetCanvas, sx, sy, b.size, b.size);
-    // grid prints top-down as the sheet runs through
-    const wipe = U.clamp((intro - 0.3) / 0.45, 0, 1);
-    if (wipe > 0) {
-      const hpx = b.size * U.easeInOutCubic(wipe);
-      ctx.drawImage(gridCanvas, 0, 0, gridCanvas.width, (hpx / b.size) * gridCanvas.height, sx, sy, b.size, hpx);
+    if (intro >= SETTLED) {
+      // the sheet, grid, die-cuts and frame don't change during play: one bitmap
+      if (baseFor !== g || baseVersion !== layoutVersion) buildBase(g);
+      ctx.drawImage(baseCanvas, sx, sy, b.size, b.size);
+    } else {
+      ctx.drawImage(sheetCanvas, sx, sy, b.size, b.size);
+      // grid prints top-down as the sheet runs through
+      const wipe = U.clamp((intro - 0.3) / 0.45, 0, 1);
+      if (wipe > 0) {
+        const hpx = b.size * U.easeInOutCubic(wipe);
+        ctx.drawImage(gridCanvas, 0, 0, gridCanvas.width, (hpx / b.size) * gridCanvas.height, sx, sy, b.size, hpx);
+      }
+      // die-cut holes
+      if (g.holes) {
+        g.holes.forEach((hole, k) => {
+          const t0 = 0.75 + k * 0.045;
+          const u = U.clamp((intro - t0) / 0.18, 0, 1);
+          if (u <= 0) return;
+          drawHole(hole, sx, sy, cs, U.easeOutBack(u, 2.2));
+        });
+      }
+      // sheet frame
+      ctx.strokeStyle = KEY;
+      ctx.lineWidth = 2;
+      ctx.strokeRect(sx + 1, sy + 1, b.size - 2, b.size - 2);
     }
-
-    // die-cut holes
-    if (g.holes) {
-      g.holes.forEach((hole, k) => {
-        const t0 = 0.75 + k * 0.045;
-        const u = U.clamp((intro - t0) / 0.18, 0, 1);
-        if (u <= 0) return;
-        drawHole(hole, sx, sy, cs, U.easeOutBack(u, 2.2));
-      });
-    }
-
-    // sheet frame
-    ctx.strokeStyle = KEY;
-    ctx.lineWidth = 2;
-    ctx.strokeRect(sx + 1, sy + 1, b.size - 2, b.size - 2);
 
     // start corners
     for (let p = 0; p < 4; p++) {
@@ -838,6 +854,30 @@
     drawSpecks(V.specks);
   };
 
+  // everything in the intro (sheet feed, grid wipe, die-cuts, tray pop-in) is finished by now
+  const SETTLED = 1.4;
+  let baseCanvas = null, baseFor = null, baseVersion = -1;
+  function buildBase(g) {
+    const { size, cs, x: bx, y: by } = L.board;
+    const px = Math.round(size * dpr);
+    if (!baseCanvas || baseCanvas.width !== px) baseCanvas = makeCanvas(px, px);
+    const x = baseCanvas.getContext('2d', { alpha: false }); // opaque, like the stage: identical blending
+    x.setTransform(1, 0, 0, 1, 0, 0);
+    x.globalAlpha = 1;
+    x.globalCompositeOperation = 'source-over';
+    x.clearRect(0, 0, px, px);
+    x.drawImage(sheetCanvas, 0, 0);
+    x.drawImage(gridCanvas, 0, 0);
+    // drawn in screen space, so every halftone dot lands exactly where the live drawing put it
+    x.setTransform(dpr, 0, 0, dpr, -bx * dpr, -by * dpr);
+    if (g.holes) for (const hole of g.holes) drawHole(hole, bx, by, cs, 1, x);
+    x.strokeStyle = KEY;
+    x.lineWidth = 2;
+    x.strokeRect(bx + 1, by + 1, size - 2, size - 2);
+    baseFor = g;
+    baseVersion = layoutVersion;
+  }
+
   function firstPlacementIdx(g, p) {
     for (let k = 0; k < g.placements.length; k++) if (g.placements[k].p === p) return k + 1;
     return 9999;
@@ -849,7 +889,7 @@
     return false;
   }
 
-  function drawHole(hole, sx, sy, cs, s) {
+  function drawHole(hole, sx, sy, cs, s, ctx = R._ctx()) {
     const n = normCells(hole);
     const o = outlineOf(n.cells);
     const w = Math.max(...n.cells.map(c => c[1])) + 1, h = Math.max(...n.cells.map(c => c[0])) + 1;
@@ -927,15 +967,15 @@
     ctx.restore();
   }
 
-  function liftedShadow(cells, ox, oy, cs, lift) {
+  function liftedShadow(cells, ox, oy, cs, lift, x = ctx) {
     if (lift <= 0.01) return;
     const o = outlineOf(cells);
-    ctx.save();
-    ctx.globalCompositeOperation = 'multiply';
-    ctx.fillStyle = halftone(KEY, 0.36 * Math.min(1, lift * 1.3), Math.max(2.2, cs * 0.14));
-    loopsPath(ctx, o.loops, ox + cs * 0.16 * lift, oy + cs * 0.24 * lift, cs);
-    ctx.fill();
-    ctx.restore();
+    x.save();
+    x.globalCompositeOperation = 'multiply';
+    x.fillStyle = halftone(KEY, 0.36 * Math.min(1, lift * 1.3), Math.max(2.2, cs * 0.14));
+    loopsPath(x, o.loops, ox + cs * 0.16 * lift, oy + cs * 0.24 * lift, cs);
+    x.fill();
+    x.restore();
   }
 
   function drawStamp(st, now) {
@@ -1032,40 +1072,134 @@
     ctx.restore();
   }
 
+  // how a tray slot looks right now
+  const BLIND = 1, SOLID = 2, SCREEN = 3, DEAD = 4, LIVE = 5;
+  const MODE = [null, 'blind', 'solid', 'screen', 'dead'];
+  function slotCode(V, pl, p, pid, active) {
+    const inHand = V.replayHands ? V.replayHands[p][pid] : pl.hand[pid];
+    if (!inHand || (V.held && V.held.p === p && V.held.pid === pid) || (V.flyingPid && V.flyingPid[p] === pid)) return BLIND;
+    if (V.lift[p][pid]) return LIVE; // lifted, nudged or settling: drawn every frame
+    if (V.over) return SCREEN;
+    if (pl.out) return DEAD;
+    if (!active) return SCREEN;
+    if (V.movable && !V.movable[pid]) return DEAD;
+    return SOLID;
+  }
+
+  // one piece in its slot, exactly as it has always been drawn
+  function drawSlot(x, s, cs, p, mode, lift, appear) {
+    if (mode === 'blind') {
+      drawPiece(x, s.cells, s.x, s.y, cs, p, 'blind');
+      return;
+    }
+    const sc = U.easeOutBack(appear, 2) * (1 + lift * 0.07);
+    const cx = s.cx, cy = s.cy;
+    x.save();
+    x.translate(cx, cy);
+    x.scale(sc, sc);
+    if (lift > 0.01) x.rotate(-lift * 0.035);
+    x.translate(-cx, -cy);
+    if (lift > 0.01) liftedShadow(s.cells, s.x, s.y, cs, lift, x);
+    drawPiece(x, s.cells, s.x - cs * 0.06 * lift, s.y - cs * 0.1 * lift, cs, p, mode === 'solid' && lift > 0.01 ? 'lifted' : mode);
+    x.restore();
+  }
+
+  function liveMode(V, pl, p, pid, active) {
+    if (V.over) return 'screen';
+    if (pl.out) return 'dead';
+    if (!active) return 'screen';
+    if (V.movable && !V.movable[pid]) return 'dead';
+    return 'solid';
+  }
+
+  // Each tray's resting pieces live in a bitmap of that tray, paper included, aligned to device pixels.
+  // It is redrawn only when a slot changes; anything in motion is drawn live on top.
+  const trayCaches = [null, null, null, null];
+  function trayCache(p, T) {
+    let c = trayCaches[p];
+    if (c && c.version === layoutVersion) return c;
+    let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+    for (const s of T.slots) {
+      x0 = Math.min(x0, s.x);
+      y0 = Math.min(y0, s.y);
+      x1 = Math.max(x1, s.x + s.w * T.cs);
+      y1 = Math.max(y1, s.y + s.h * T.cs);
+    }
+    // ink spills past a slot by its outline and misregistration
+    const spill = 2 + T.cs * 0.12;
+    const m = Math.ceil(spill) + 1;
+    let rx0 = Math.max(0, T.x - m), ry0 = Math.max(0, T.y - m);
+    let rx1 = Math.min(W, T.x + T.w + m), ry1 = Math.min(H, T.y + T.h + m);
+    // keep clear of the board, its live shadow, and how far a hard print shakes it
+    const b = L.board, keep = Math.round(U.clamp(b.cs * 0.34, 6, 15)) + 6;
+    const bx0 = b.x - 6, by0 = b.y - 6, bx1 = b.x + b.size + keep, by1 = b.y + b.size + keep;
+    if (rx1 > bx0 && rx0 < bx1 && ry1 > by0 && ry0 < by1) {
+      if (T.x >= b.x + b.size) rx0 = Math.max(rx0, bx1);
+      else if (T.x + T.w <= b.x) rx1 = Math.min(rx1, bx0);
+      else if (T.y >= b.y + b.size) ry0 = Math.max(ry0, by1);
+      else ry1 = Math.min(ry1, by0);
+    }
+    const dx = Math.ceil(rx0 * dpr), dy = Math.ceil(ry0 * dpr);
+    const cw = Math.max(1, Math.floor(rx1 * dpr) - dx), ch = Math.max(1, Math.floor(ry1 * dpr) - dy);
+    // on a screen too small for the pieces to fit their tray, that tray is simply drawn live
+    const fits = (x0 - spill) * dpr >= dx && (y0 - spill) * dpr >= dy && (x1 + spill) * dpr <= dx + cw && (y1 + spill) * dpr <= dy + ch;
+    const canvas = makeCanvas(cw, ch);
+    c = { canvas, x: canvas.getContext('2d', { alpha: false }), fits, dx, dy, cw, ch, version: layoutVersion, k0: -1, k1: -1, k2: -1, codes: new Uint8Array(21) };
+    trayCaches[p] = c;
+    return c;
+  }
+
   function drawTrays(V, intro) {
     const g = V.g;
+    const settled = intro >= SETTLED;
     for (let p = 0; p < 4; p++) {
       const T = L.trays[p];
       const pl = g.players[p];
       const active = V.turnP === p;
       const cs = T.cs;
-      for (const s of T.slots) {
-        const pid = s.pid;
-        const appear = U.clamp((intro - 0.45 - p * 0.08 - TRAY_ORDER.indexOf(pid) * 0.022) / 0.22, 0, 1);
-        if (appear <= 0) continue;
-        const inHand = V.replayHands ? V.replayHands[p][pid] : pl.hand[pid];
-        const isHeld = V.held && V.held.p === p && V.held.pid === pid;
-        const flying = V.flyingPid && V.flyingPid[p] === pid;
-        if (!inHand || isHeld || flying) {
-          drawPiece(ctx, s.cells, s.x, s.y, cs, p, 'blind');
-          continue;
+      if (!settled || !trayCache(p, T).fits) {
+        // pieces popping in during the intro
+        for (const s of T.slots) {
+          const pid = s.pid;
+          const appear = U.clamp((intro - 0.45 - p * 0.08 - TRAY_ORDER.indexOf(pid) * 0.022) / 0.22, 0, 1);
+          if (appear <= 0) continue;
+          const code = slotCode(V, pl, p, pid, active);
+          const mode = code === BLIND ? 'blind' : liveMode(V, pl, p, pid, active);
+          drawSlot(ctx, s, cs, p, mode, code === LIVE ? V.lift[p][pid] : 0, appear);
         }
-        let mode = 'solid';
-        if (V.over) mode = 'screen';
-        else if (pl.out) mode = 'dead';
-        else if (!active) mode = 'screen';
-        else if (V.movable && !V.movable[pid]) mode = 'dead';
-        const lift = V.lift[p][pid] || 0;
-        const sc = U.easeOutBack(appear, 2) * (1 + lift * 0.07);
-        const cx = s.cx, cy = s.cy;
-        ctx.save();
-        ctx.translate(cx, cy);
-        ctx.scale(sc, sc);
-        if (lift > 0.01) ctx.rotate(-lift * 0.035);
-        ctx.translate(-cx, -cy);
-        if (lift > 0.01) liftedShadow(s.cells, s.x, s.y, cs, lift);
-        drawPiece(ctx, s.cells, s.x - cs * 0.06 * lift, s.y - cs * 0.1 * lift, cs, p, mode === 'solid' && lift > 0.01 ? 'lifted' : mode);
-        ctx.restore();
+        continue;
+      }
+      const c = trayCache(p, T);
+      const codes = c.codes;
+      let k0 = 0, k1 = 0, k2 = 0, live = false;
+      for (let pid = 0; pid < 21; pid++) {
+        const code = slotCode(V, pl, p, pid, active);
+        codes[pid] = code;
+        if (code === LIVE) live = true;
+        if (pid < 10) k0 = k0 * 8 + code;
+        else if (pid < 20) k1 = k1 * 8 + code;
+        else k2 = code;
+      }
+      if (k0 !== c.k0 || k1 !== c.k1 || k2 !== c.k2) {
+        const x = c.x;
+        x.setTransform(1, 0, 0, 1, 0, 0);
+        x.globalAlpha = 1;
+        x.globalCompositeOperation = 'source-over';
+        x.drawImage(bgCanvas, c.dx, c.dy, c.cw, c.ch, 0, 0, c.cw, c.ch); // the paper under this tray
+        x.setTransform(dpr, 0, 0, dpr, -c.dx, -c.dy); // screen space, so halftones line up
+        for (const s of T.slots) {
+          const code = codes[s.pid];
+          if (code !== LIVE) drawSlot(x, s, cs, p, MODE[code], 0, 1);
+        }
+        c.k0 = k0;
+        c.k1 = k1;
+        c.k2 = k2;
+      }
+      ctx.drawImage(c.canvas, c.dx / dpr, c.dy / dpr, c.cw / dpr, c.ch / dpr);
+      if (live) {
+        for (const s of T.slots) {
+          if (codes[s.pid] === LIVE) drawSlot(ctx, s, cs, p, liveMode(V, pl, p, s.pid, active), V.lift[p][s.pid], 1);
+        }
       }
     }
   }
@@ -1107,7 +1241,7 @@
 
   R.init = canvas => {
     cv = canvas;
-    ctx = cv.getContext('2d');
+    ctx = cv.getContext('2d', { alpha: false });
     makeTextures();
   };
 })(window);
