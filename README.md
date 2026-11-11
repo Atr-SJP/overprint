@@ -2,7 +2,8 @@
 
 A four-ink territory game, printed risograph-style. Lay your pieces corner to corner, grab ink drops to bend the rules, and run your rivals out of room.
 
-**Play:** open `index.html` in Chrome, Safari, Edge or Firefox. No install, no build step.
+**Play online:** https://atr-sjp.github.io/overprint/
+**Play locally:** open `index.html` in Chrome, Safari, Edge or Firefox. No install, no build step.
 **Put it online:** `dist/index.html` is the whole game in one file. Drop the `dist` folder on any static host (for example Netlify Drop) to get a public link. After changing the game, rebuild it with `python3 .claude/build_standalone.py . dist/index.html`.
 Fonts (Archivo, Martian Mono) load from Google Fonts when online. Everything else, including art, animation, sound and music, is generated in code.
 
